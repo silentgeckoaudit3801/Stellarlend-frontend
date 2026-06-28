@@ -61,6 +61,53 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
+// Request envelope guards
+// ---------------------------------------------------------------------------
+
+describe("POST /api/webhooks/transactions - request envelope guards", () => {
+  it("returns 415 before signature verification for non-JSON content", async () => {
+    const body = JSON.stringify(makePayload());
+    const req = makeWebhookRequest(body, {
+      "Content-Type": "text/plain",
+    });
+
+    const res = await POST(req);
+    expect(res.status).toBe(415);
+
+    const json = await res.json();
+    expect(json.error).toMatch(/content type/i);
+  });
+
+  it("returns 413 before signature verification when Content-Length is too large", async () => {
+    const body = JSON.stringify(makePayload());
+    const req = makeWebhookRequest(body, {
+      "Content-Length": String(65 * 1024),
+    });
+
+    const res = await POST(req);
+    expect(res.status).toBe(413);
+
+    const json = await res.json();
+    expect(json.error).toMatch(/too large/i);
+  });
+
+  it("returns 413 when the decoded body exceeds the size cap", async () => {
+    const payload = makePayload({
+      data: {
+        transaction_id: "TXN12346",
+        status: "Completed",
+        padding: "x".repeat(65 * 1024),
+      },
+    });
+    const body = JSON.stringify(payload);
+    const signature = signPayload(body, TEST_SECRET);
+    const req = makeWebhookRequest(body, { [SIGNATURE_HEADER]: signature });
+
+    const res = await POST(req);
+    expect(res.status).toBe(413);
+  });
+});
+// ---------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------
 
