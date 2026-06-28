@@ -6,12 +6,41 @@ import {
   NonceStore,
 } from "@/lib/webhooks/verify";
 import { SIGNATURE_HEADER } from "@/lib/webhooks/types";
+import {
+  isStrictModeEnabled,
+  resolveAccountByMemo,
+  validateMemo,
+  type MemoType,
+} from "@/lib/stellar/memo";
 import type { WebhookPayload } from "@/lib/webhooks/types";
-import { updateTransactionStatus } from "@/lib/transactions/store";
+import {
+  getTransaction,
+  updateTransactionStatus,
+} from "@/lib/transactions/store";
 import { enqueueNotificationInBackground } from "@/lib/notifications/repository";
 
 export const runtime = "nodejs";
+const MAX_WEBHOOK_BODY_BYTES = 64 * 1024;
+const JSON_CONTENT_TYPES = new Set(["application/json", "application/webhook+json"]);
 
+function isJsonContentType(value: string | null): boolean {
+  if (!value) return false;
+  const [mediaType] = value.split(";", 1);
+  const normalized = mediaType.trim().toLowerCase();
+  return JSON_CONTENT_TYPES.has(normalized) || normalized.endsWith("+json");
+}
+
+function getDeclaredBodySize(req: NextRequest): number | null {
+  const raw = req.headers.get("content-length");
+  if (!raw) return null;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
+function getUtf8ByteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
 /** Module-level nonce store for replay protection. */
 const nonceStore = new NonceStore();
 
@@ -37,6 +66,20 @@ export async function POST(req: NextRequest) {
   }
 
   // ── 2. Read raw body (required for HMAC verification) ───────────────────
+  if (!isJsonContentType(req.headers.get("content-type"))) {
+    return NextResponse.json(
+      { error: "Unsupported content type; expected application/json" },
+      { status: 415 },
+    );
+  }
+
+  const declaredBodySize = getDeclaredBodySize(req);
+  if (declaredBodySize !== null && declaredBodySize > MAX_WEBHOOK_BODY_BYTES) {
+    return NextResponse.json(
+      { error: "Webhook payload too large" },
+      { status: 413 },
+    );
+  }
   let rawBody: string;
   try {
     rawBody = await req.text();
@@ -47,6 +90,12 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  if (getUtf8ByteLength(rawBody) > MAX_WEBHOOK_BODY_BYTES) {
+    return NextResponse.json(
+      { error: "Webhook payload too large" },
+      { status: 413 },
+    );
+  }
   // ── 3. Verify signature ─────────────────────────────────────────────────
   const signature = req.headers.get(SIGNATURE_HEADER) || "";
   if (!verifyWebhookSignature(rawBody, signature, secret)) {
@@ -125,7 +174,7 @@ export async function POST(req: NextRequest) {
   const memoType = rawData.memo_type;
 
   if (memo || memoType) {
-    const type = (memoType || 'MEMO_TEXT') as any;
+    const type = (memoType || 'MEMO_TEXT') as MemoType;
     const value = memo || '';
 
     // Validate format
